@@ -34,6 +34,7 @@ setup(
             'teleop_honomic = elephant_control.teleop_holonomic:main',
             'cam_teleop = elephant_control.cam_teleop:main',
             'cam_publisher = elephant_control.cam_publisher:main',
+            'speed_ctrl = elephant_control.speed_ctrl:main',
         ],
     },
 )

@@ -1,123 +1,81 @@
 #!/usr/bin/env python3
 import sys
 import os
-# บังคับใช้ venv
 sys.path.append('/home/chaiyapruk/venv_496/lib/python3.12/site-packages')
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import cv2
 import mediapipe as mp
 import math
 
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-
-class SpeedManager(Node):
+class SpeedControl(Node):
     def __init__(self):
-        super().__init__('speed_manager_node')
-        
+        super().__init__('speed_ctrl_node')
+        self.speed_pub = self.create_publisher(Vector3, '/speed_settings', 10)
         self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
         self.bridge = CvBridge()
 
-        # โหลดโมเดล (ใช้ Absolute Path ตามเดิม)
+        # ค่าเริ่มต้น 40% ตามโจทย์
+        self.lin_v, self.ang_v = 0.4, 1.0
+        self.lin_a, self.ang_a = 0.4, 0.4
+
         model_path = '/home/chaiyapruk/660610817_final/src/elephant_control/elephant_control/hand_landmarker.task'
-        base_options = python.BaseOptions(model_asset_path=model_path)
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python import vision
         options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            num_hands=1, # สนใจแค่มือเดียวที่เจอ (เราจะกรองว่าเป็นมือขวา)
+            base_options=python.BaseOptions(model_asset_path=model_path),
+            num_hands=2, # ต้องเป็น 2 เช่นกัน
             min_hand_detection_confidence=0.8
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
-
-        # --- ค่าเริ่มต้น (40%) ---
-        self.linear_vel = 0.4
-        self.angular_vel = 0.4
-        self.linear_accel = 0.4
-        self.angular_accel = 0.4
-        
-        self.get_logger().info("Speed Manager Node Started - Right Hand Control")
 
     def image_callback(self, msg):
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        detection_result = self.detector.detect(mp_image)
-        
-        status = "RIGHT HAND: WAITING"
-        color = (200, 200, 200)
+        res = self.detector.detect(mp_image)
+        status, color = "R: IDLE", (255, 255, 255)
 
-        if detection_result.hand_landmarks and detection_result.handedness:
-            # MediaPipe มองมือขวา (หลัง Flip) เป็น "Left" 
-            # (เนื่องจากคุณบอกว่ามือซ้ายระบบเห็นเป็น Right ดังนั้นมือขวาระบบจะเห็นเป็น Left)
-            hand_label = detection_result.handedness[0][0].category_name
-            
-            if hand_label == "Left": 
-                landmarks = detection_result.hand_landmarks[0]
-                
-                # ดึงจุดที่ใช้งาน
-                wrist = landmarks[0]
-                thumb_tip = landmarks[4]
-                index_mcp = landmarks[5]
-                index_tip = landmarks[8]
-                ring_tip = landmarks[16]
-                pinky_tip = landmarks[20]
+        if res.hand_landmarks:
+            for i in range(len(res.hand_landmarks)):
+                if res.handedness[i][0].category_name == "Left": # มือขวาเรา
+                    lm = res.hand_landmarks[i]
+                    t_tip, i_tip, r_tip, p_tip = lm[4], lm[8], lm[16], lm[20]
+                    i_mcp, p_mcp = lm[5], lm[17]
+                    
+                    is_i_up = i_tip.y < i_mcp.y - 0.08
+                    is_p_up = p_tip.y < p_mcp.y - 0.08
+                    is_r_up = r_tip.y < lm[13].y - 0.08
+                    is_t_open = abs(t_tip.x - i_mcp.x) > 0.12
+                    dx = i_tip.x - i_mcp.x
+                    step = 0.01 if dx > 0.06 else -0.01 if dx < -0.06 else 0
 
-                # เช็คการกางนิ้วโป้ง (เทียบกับข้อมือ)
-                thumb_dist = math.sqrt((thumb_tip.x - wrist.x)**2 + (thumb_tip.y - wrist.y)**2)
-                is_thumb_open = thumb_dist > 0.18
-                
-                # เช็คสถานะการชูนัด
-                is_index_up = index_tip.y < index_mcp.y - 0.08
-                is_pinky_up = pinky_tip.y < wrist.y - 0.15
-                is_ring_up = ring_tip.y < wrist.y - 0.15
-                
-                # ความเอียง (dX) สำหรับการเพิ่ม/ลดค่า
-                dx = index_tip.x - index_mcp.x
-                change = 0.0 # ค่าที่จะปรับเปลี่ยน
-                if dx > 0.06: change = 0.01   # เอียงขวา เพิ่ม
-                elif dx < -0.06: change = -0.01 # เอียงซ้าย ลด
+                    if is_i_up: # นิ้วชี้ Priority 1
+                        if not is_t_open: self.lin_v = max(0.1, min(1.0, self.lin_v + step)); status = f"SET LIN VEL: {self.lin_v:.2f}"
+                        else: self.ang_v = max(0.5, min(2.5, self.ang_v + step)); status = f"SET ANG VEL: {self.ang_v:.2f}"
+                        color = (0, 255, 255)
+                    elif is_p_up: # นิ้วก้อย
+                        self.lin_a = max(0.1, min(1.0, self.lin_a + step)); status = f"SET LIN ACC: {self.lin_a:.2f}"
+                        color = (255, 0, 255)
+                    elif is_r_up: # นิ้วนาง
+                        self.ang_a = max(0.1, min(1.0, self.ang_a + step)); status = f"SET ANG ACC: {self.ang_a:.2f}"
+                        color = (0, 255, 255)
+                    break
 
-                # --- Logic การเลือกโหมด (Priority: Index > Pinky > Ring) ---
-                if is_index_up:
-                    if not is_thumb_open:
-                        self.linear_vel = max(0.0, min(1.0, self.linear_vel + change))
-                        status = f"ADJUST: LINEAR VEL ({self.linear_vel:.2%})"
-                    else:
-                        self.angular_vel = max(0.0, min(1.0, self.angular_vel + change))
-                        status = f"ADJUST: ANGULAR VEL ({self.angular_vel:.2%})"
-                    color = (0, 255, 255)
-                
-                elif is_pinky_up:
-                    self.linear_accel = max(0.0, min(1.0, self.linear_accel + change))
-                    status = f"ADJUST: LINEAR ACCEL ({self.linear_accel:.2%})"
-                    color = (255, 0, 255)
-                
-                elif is_ring_up:
-                    if is_thumb_open:
-                        self.angular_accel = max(0.0, min(1.0, self.angular_accel + change))
-                        status = f"ADJUST: ANGULAR ACCEL ({self.angular_accel:.2%})"
-                    color = (255, 255, 0)
-
-                # วาดจุดเพื่อ Debug
-                for id in [4, 8, 16, 20]:
-                    lm = landmarks[id]
-                    cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 8, color, -1)
-
-        # แสดงผลสี่เหลี่ยมตามที่คุณต้องการ (ยาวขึ้นและบางลง)
-        cv2.rectangle(frame, (0, 0), (640, 60), (30, 30, 30), -1)
+        self.speed_pub.publish(Vector3(x=float(self.lin_v), y=float(self.ang_vel), z=0.0))
+        cv2.rectangle(frame, (0, 0), (w, 60), (30, 30, 30), -1)
         cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        cv2.imshow('Right Hand Speed Manager', frame)
+        cv2.imshow('Right Hand Speed Control', frame)
         cv2.waitKey(1)
 
 def main():
     rclpy.init()
-    node = SpeedManager()
+    node = SpeedControl()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
