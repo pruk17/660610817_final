@@ -16,6 +16,14 @@ import math
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from std_msgs.msg import Bool
+
+default_speed = 0.3
+MAX_LINEAR = 4.0
+MIN_LINEAR = 0.1
+
+MAX_ANGULAR = 4.0
+MIN_ANGULAR = 0.2
 
 class CamTeleop(Node):
 
@@ -37,12 +45,19 @@ class CamTeleop(Node):
             self.image_callback,
             10
         )
+        self.reset_sub = self.create_subscription(
+            Bool,
+            '/reset_speed_cmd',
+            self.reset_callback,
+            10
+        )
 
         self.bridge = CvBridge()
 
+        
         # speed values
-        self.base_linear_speed = 0.4
-        self.base_angular_speed = 0.4
+        self.base_linear_speed = default_speed
+        self.base_angular_speed = default_speed
 
         self.frame_id = 0
 
@@ -74,6 +89,16 @@ class CamTeleop(Node):
 
     def distance(self, a, b):
         return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+    
+
+    def reset_callback(self, msg):
+        if msg.data:
+
+            self.base_linear_speed = default_speed
+            self.base_angular_speed = default_speed
+
+            self.get_logger().info("Speed reset from service")
+    
 
     def image_callback(self, msg):
 
@@ -219,20 +244,20 @@ class CamTeleop(Node):
                         if not is_thumb_open:
 
                             if self.smooth_dx_r > 0.04:
-                                self.base_linear_speed = min(1.0, self.base_linear_speed + 0.02)
+                                self.base_linear_speed = min(MAX_LINEAR, self.base_linear_speed + 0.02)
 
                             elif self.smooth_dx_r < -0.04:
-                                self.base_linear_speed = max(0.1, self.base_linear_speed - 0.02)
+                                self.base_linear_speed = max(MIN_LINEAR, self.base_linear_speed - 0.02)
 
                             status_r = "R: LIN SPEED"
 
                         else:
 
                             if self.smooth_dx_r > 0.04:
-                                self.base_angular_speed = min(2.5, self.base_angular_speed + 0.02)
+                                self.base_angular_speed = min(MAX_ANGULAR, self.base_angular_speed + 0.02)
 
                             elif self.smooth_dx_r < -0.04:
-                                self.base_angular_speed = max(0.2, self.base_angular_speed - 0.02)
+                                self.base_angular_speed = max(MIN_ANGULAR, self.base_angular_speed - 0.02)
 
                             status_r = "R: ANG SPEED"
 
