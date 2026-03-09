@@ -38,6 +38,7 @@ setup(
             'client = elephant_control.set_speed_client:main',
             'distance_scan = elephant_control.scan_distance_receiver:main',
             'UDP_run = elephant_control.Laptop_UDP:main',
+            'lidar = elephant_control.lidar:main',
         ],
     },
 )

@@ -22,11 +22,12 @@ from mediapipe.tasks.python import vision
 
 from std_msgs.msg import Bool
 
-default_speed = 0.3
-MAX_LINEAR = 4.0
+default_Lspeed = 0.2
+default_Aspeed = 0.3
+MAX_LINEAR = 1.0
 MIN_LINEAR = 0.1
 
-MAX_ANGULAR = 4.0
+MAX_ANGULAR = 1.0
 MIN_ANGULAR = 0.2
 
 class CamTeleop(Node):
@@ -55,13 +56,15 @@ class CamTeleop(Node):
             self.reset_callback,
             10
         )
+        self.create_subscription(Bool, '/slow_speed_cmd', self.slow_callback, 10)
+        self.create_subscription(Bool, '/stop_speed_cmd', self.stop_callback, 10)
 
         self.bridge = CvBridge()
 
         
         # speed values
-        self.base_linear_speed = default_speed
-        self.base_angular_speed = default_speed
+        self.base_linear_speed = default_Lspeed
+        self.base_angular_speed = default_Aspeed
 
         self.frame_id = 0
 
@@ -98,11 +101,23 @@ class CamTeleop(Node):
     def reset_callback(self, msg):
         if msg.data:
 
-            self.base_linear_speed = default_speed
-            self.base_angular_speed = default_speed
+            self.base_linear_speed = default_Lspeed
+            self.base_angular_speed = default_Aspeed
 
             self.get_logger().info("Speed reset from service")
-    
+
+    def slow_callback(self, msg):
+        if msg.data:
+            self.base_linear_speed  = 0.10
+            self.base_angular_speed = 0.2
+            self.get_logger().warn('slow_speed: linear=0.10  angular=0.2')
+
+    def stop_callback(self, msg):
+        if msg.data:
+            self.base_linear_speed  = 0.0
+            self.base_angular_speed = 0.0
+            self.publisher_.publish(Twist())
+            self.get_logger().error('stop_speed: STOPPED')
 
     def image_callback(self, msg):
 

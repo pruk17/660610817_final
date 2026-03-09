@@ -24,12 +24,20 @@ def generate_launch_description():
         name='set_speed_service_server',
         output='screen'
     )
+
+    laptop_UDP_receiver = Node(
+        package='elephant_control',
+        executable='UDP_run',
+        name='UDP_receiver_runner',
+        output='screen'
+    )
     
 
 
     return LaunchDescription([
         camera_node,
         teleop_node,
-        reset_speed_server
+        reset_speed_server,
+        laptop_UDP_receiver
         
     ])
