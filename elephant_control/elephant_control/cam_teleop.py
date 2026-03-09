@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import sys
 sys.path.append('/home/chaiyapruk/venv_496/lib/python3.12/site-packages')
+#if ros bridge failed: 
+#pkill -f ros
+#pkill -f cyclonedds
+#sudo rm -rf /dev/shm/fastrtps* 2>/dev/null
 
 import rclpy
 from rclpy.node import Node

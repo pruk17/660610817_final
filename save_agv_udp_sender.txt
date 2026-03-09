@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+node1_udp_gateway_agv.py
+????? AGV  (ROS_DOMAIN_ID=0)
+
+Flow ???:  Laptop UDP:15000  ? /cmd_vel  (????????? motor)
+Flow ???:  /scan_distance    ? UDP:15001 ? Laptop
+
+run:
+  ROS_DOMAIN_ID=0 python3 node1_udp_gateway_agv.py \
+    --ros-args -p laptop_ip:=10.244.171.183
+"""
+
+import socket
+import threading
+import time
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32
+
+
+class UdpGatewayAgv(Node):
+
+    def __init__(self):
+        super().__init__('udp_gateway_agv')
+
+        self.declare_parameter('laptop_ip',  '10.244.171.183')  # IP  Laptop
+        self.declare_parameter('cmd_port',   15000)
+        self.declare_parameter('data_port',  15001)
+        self.declare_parameter('cmd_timeout', 0.5)
+
+        self.laptop_ip   = self.get_parameter('laptop_ip').value
+        self.cmd_port    = self.get_parameter('cmd_port').value
+        self.data_port   = self.get_parameter('data_port').value
+        self.cmd_timeout = self.get_parameter('cmd_timeout').value
+
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self.cmd_pub  = self.create_publisher(Twist, '/cmd_vel', qos)
+        self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_recv.bind(('0.0.0.0', self.cmd_port))
+
+        self.last_rx = time.time()
+        threading.Thread(target=self._cmd_loop, daemon=True).start()
+        self.create_timer(0.1, self._watchdog)
+
+        self.sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.create_subscription(
+            Float32, '/scan_distance', self._dist_cb, qos)
+
+        self.get_logger().info(
+            f'[AGV | DOMAIN 0] UDP:{self.cmd_port} ? /cmd_vel')
+        self.get_logger().info(
+            f'[AGV | DOMAIN 0] /scan_distance ? UDP {self.laptop_ip}:{self.data_port}')
+
+    def _cmd_loop(self):
+        self.sock_recv.settimeout(1.0)
+        while rclpy.ok():
+            try:
+                data, _ = self.sock_recv.recvfrom(2048)
+                parts = data.decode().strip().split()
+                if len(parts) == 3:
+                    x, y, z = map(float, parts)
+                    msg = Twist()
+                    msg.linear.x  = x
+                    msg.linear.y  = y
+                    msg.angular.z = z
+                    self.cmd_pub.publish(msg)
+                    self.last_rx = time.time()
+            except socket.timeout:
+                pass
+            except Exception as e:
+                if rclpy.ok():
+                    self.get_logger().warn(f'CMD recv error: {e}')
+
+    def _watchdog(self):
+        if time.time() - self.last_rx > self.cmd_timeout:
+            self.cmd_pub.publish(Twist())
+
+    def _dist_cb(self, msg: Float32):
+        data = f'{msg.data:.4f}'
+        self.sock_send.sendto(data.encode(), (self.laptop_ip, self.data_port))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = UdpGatewayAgv()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
