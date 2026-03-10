@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+scan_filter_node.py ? Run on AGV (ROS_DOMAIN_ID=0)
+
+Subscribes to /scan (LaserScan from YDLIDAR) and extracts the nearest
+obstacle point, then publishes it as a compact String to /scan_distance.
+
+Output format: "distance_m,angle_deg"
+  e.g. "0.1150,045.2"
+  - distance: nearest obstacle in meters
+  - angle: 0 = front of robot, clockwise
+
+The filtered topic is forwarded to the Laptop via UDP by UDP_sender.py.
+"""
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
+import math
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+
+class ScanFilterNode(Node):
+
+    def __init__(self):
+        super().__init__('scan_filter_node')
+
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self.subscription = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, qos)
+
+        self.dist_pub = self.create_publisher(String, '/scan_distance', 10)
+
+        self.max_distance = 0.30   # log only when obstacle closer than 300 mm
+        self.last_send    = 0.0
+        self.last_print   = 0.0
+
+        self.get_logger().info('Scan Filter Node Started (distance + angle mode)')
+
+    def scan_callback(self, msg):
+        # Rate limit to 10 Hz to reduce UDP traffic
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_send < 0.1:
+            return
+
+        # Find the nearest valid range reading
+        min_dist  = float('inf')
+        min_index = -1
+
+        for i, r in enumerate(msg.ranges):
+            if math.isinf(r) or math.isnan(r):
+                continue
+            if not (msg.range_min < r < msg.range_max):
+                continue
+            if r < min_dist:
+                min_dist  = r
+                min_index = i
+
+        if min_index < 0:
+            return
+
+        # Convert index to angle in degrees (0 = front, clockwise)
+        angle_rad = msg.angle_min + min_index * msg.angle_increment
+        angle_deg = math.degrees(angle_rad) % 360
+
+        # Publish as "distance,angle" string
+        out = String()
+        out.data = f'{min_dist:.4f},{angle_deg:.1f}'
+        self.dist_pub.publish(out)
+        self.last_send = now
+
+        # Log only when obstacle is within max_distance (reduce spam)
+        if now - self.last_print > 0.8 and min_dist < self.max_distance:
+            self.get_logger().info(
+                f'Nearest: {min_dist*1000:.1f} mm @ {angle_deg:.1f} deg')
+            self.last_print = now
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    try:
+        node = ScanFilterNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
