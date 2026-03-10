@@ -5,7 +5,6 @@ sys.path.append('/home/chaiyapruk/venv_496/lib/python3.12/site-packages')
 #pkill -f ros
 #pkill -f cyclonedds
 #sudo rm -rf /dev/shm/fastrtps* 2>/dev/null
-
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -22,18 +21,23 @@ from mediapipe.tasks.python import vision
 
 from std_msgs.msg import Bool
 
+# Default speeds
 default_Lspeed = 0.2
 default_Aspeed = 0.3
-MAX_LINEAR = 1.0
-MIN_LINEAR = 0.1
-
+MAX_LINEAR  = 1.0
+MIN_LINEAR  = 0.1
 MAX_ANGULAR = 1.0
 MIN_ANGULAR = 0.2
+
+# Speed limits when obstacle detected
+SLOW_LINEAR  = 0.10
+SLOW_ANGULAR = 0.2
+
 
 class CamTeleop(Node):
 
     def __init__(self):
-        super().__init__('cam_teleop_node')
+        super().__init__('cam_teleop_control')
 
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -41,37 +45,29 @@ class CamTeleop(Node):
             depth=5
         )
 
-        self.publisher_ = self.create_publisher(
-            Twist, '/cmd_vel_command', qos_profile)
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel_command', qos_profile)
+        self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
 
-        self.subscription = self.create_subscription(
-            Image,
-            '/camera/image_raw',
-            self.image_callback,
-            10
-        )
-        self.reset_sub = self.create_subscription(
-            Bool,
-            '/reset_speed_cmd',
-            self.reset_callback,
-            10
-        )
-        self.create_subscription(Bool, '/slow_speed_cmd', self.slow_callback, 10)
-        self.create_subscription(Bool, '/stop_speed_cmd', self.stop_callback, 10)
+        # Speed service subscribers
+        self.create_subscription(Bool, '/reset_speed_cmd', self.reset_callback, 10)
+        self.create_subscription(Bool, '/slow_speed_cmd',  self.slow_callback,  10)
+        self.create_subscription(Bool, '/stop_speed_cmd',  self.stop_callback,  10)
 
         self.bridge = CvBridge()
-
-        
-        # speed values
-        self.base_linear_speed = default_Lspeed
+        self.base_linear_speed  = default_Lspeed
         self.base_angular_speed = default_Aspeed
+        self.is_stopped = False   # True = block hand commands, obstacle detected
 
+        # Smoothing filters (separate per hand)
+        self.smooth_thumb_dist_l = 0.0
+        self.smooth_dx_l = 0.0
+        self.smooth_thumb_dist_r = 0.0
+        self.smooth_dx_r = 0.0
+        self.alpha = 0.5
         self.frame_id = 0
 
         model_path = '/home/chaiyapruk/660610817_final/src/elephant_control/elephant_control/hand_landmarker.task'
-
         base_options = python.BaseOptions(model_asset_path=model_path)
-
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
             num_hands=2,
@@ -80,254 +76,181 @@ class CamTeleop(Node):
             min_hand_presence_confidence=0.35,
             min_tracking_confidence=0.35
         )
-
         self.detector = vision.HandLandmarker.create_from_options(options)
-
-        # smoothing (separate hands)
-        self.smooth_thumb_dist_l = 0.0
-        self.smooth_dx_l = 0.0
-
-        self.smooth_thumb_dist_r = 0.0
-        self.smooth_dx_r = 0.0
-
-        self.alpha = 0.5
-
         self.get_logger().info("Dual Hand Teleop Controller Started")
 
     def distance(self, a, b):
-        return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
-    
+        return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
 
+    # Speed service callbacks
     def reset_callback(self, msg):
         if msg.data:
-
-            self.base_linear_speed = default_Lspeed
+            self.base_linear_speed  = default_Lspeed
             self.base_angular_speed = default_Aspeed
-
-            self.get_logger().info("Speed reset from service")
+            self.is_stopped = False
+            self.get_logger().info(f'[reset_speed] linear={default_Lspeed}  angular={default_Aspeed}')
 
     def slow_callback(self, msg):
         if msg.data:
-            self.base_linear_speed  = 0.10
-            self.base_angular_speed = 0.2
-            self.get_logger().warn('slow_speed: linear=0.10  angular=0.2')
+            self.base_linear_speed  = SLOW_LINEAR
+            self.base_angular_speed = SLOW_ANGULAR
+            self.get_logger().warn(f'[slow_speed] linear={SLOW_LINEAR}  angular={SLOW_ANGULAR}')
 
     def stop_callback(self, msg):
         if msg.data:
-            self.base_linear_speed  = 0.0
-            self.base_angular_speed = 0.0
-            self.publisher_.publish(Twist())
-            self.get_logger().error('stop_speed: STOPPED')
+            self.is_stopped = True
+            self.publisher_.publish(Twist())   # send zero immediately
+            self.get_logger().error('[stop_speed] STOPPED')
 
     def image_callback(self, msg):
-
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         frame = cv2.flip(frame, 1)
-
         h, w, _ = frame.shape
 
         mp_image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
             data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         )
-
-        detection_result = self.detector.detect_for_video(
-            mp_image,
-            self.frame_id
-        )
-
+        detection_result = self.detector.detect_for_video(mp_image, self.frame_id)
         self.frame_id += 1
 
-        linear_x = 0.0
-        linear_y = 0.0
+        linear_x  = 0.0
+        linear_y  = 0.0
         angular_z = 0.0
+        status_l  = "L: STOP"
+        status_r  = "R: SPEED CTRL"
+        color_l   = (0, 0, 255)
+        color_r   = (255, 255, 255)
 
-        status_l = "L: STOP"
-        status_r = "R: SPEED CTRL"
-
-        color_l = (0, 0, 255)
-        color_r = (255, 255, 255)
-
-        if detection_result.hand_landmarks:
-
+        # Process hand landmarks only when not stopped
+        if detection_result.hand_landmarks and not self.is_stopped:
             for i in range(len(detection_result.hand_landmarks)):
-
-                lm = detection_result.hand_landmarks[i]
+                lm         = detection_result.hand_landmarks[i]
                 hand_label = detection_result.handedness[i][0].category_name
 
-                # LEFT HAND (movement)
+                # Right hand (mirrored) = movement control
                 if hand_label == "Right":
-
-                    t_tip = lm[4]
-                    i_mcp = lm[5]
-                    i_tip = lm[8]
-
-                    wrist = lm[0]
+                    t_tip      = lm[4]
+                    i_mcp      = lm[5]
+                    i_tip      = lm[8]
+                    wrist      = lm[0]
                     middle_mcp = lm[9]
 
-                    hand_size = self.distance(wrist, middle_mcp)
+                    hand_size  = self.distance(wrist, middle_mcp)
                     thumb_dist = self.distance(t_tip, i_mcp)
-
                     dx = i_tip.x - i_mcp.x
 
-                    self.smooth_thumb_dist_l = (
-                        self.alpha * thumb_dist +
-                        (1 - self.alpha) * self.smooth_thumb_dist_l
-                    )
+                    self.smooth_thumb_dist_l = self.alpha * thumb_dist + (1-self.alpha) * self.smooth_thumb_dist_l
+                    self.smooth_dx_l         = self.alpha * dx          + (1-self.alpha) * self.smooth_dx_l
 
-                    self.smooth_dx_l = (
-                        self.alpha * dx +
-                        (1 - self.alpha) * self.smooth_dx_l
-                    )
-
-                    is_i_up = i_tip.y < i_mcp.y - 0.08
+                    is_i_up   = i_tip.y < i_mcp.y - 0.08
                     is_t_open = self.smooth_thumb_dist_l > (hand_size * 0.35)
 
                     if is_i_up:
-
                         if is_t_open:
-
+                            # Forward + rotate
                             linear_x = self.base_linear_speed * 0.5
-
                             if self.smooth_dx_l < -0.04:
                                 angular_z = self.base_angular_speed
-                                status_l = "L: ROTATE L"
-
+                                status_l  = "L: ROTATE L"
                             elif self.smooth_dx_l > 0.04:
                                 angular_z = -self.base_angular_speed
-                                status_l = "L: ROTATE R"
-
+                                status_l  = "L: ROTATE R"
                             else:
                                 status_l = "L: FORWARD (ROT)"
-
                         else:
-
+                            # Forward + strafe
                             linear_x = self.base_linear_speed
-
                             if self.smooth_dx_l < -0.05:
                                 linear_y = self.base_linear_speed
                                 status_l = "L: SLIDE L"
-
                             elif self.smooth_dx_l > 0.05:
                                 linear_y = -self.base_linear_speed
                                 status_l = "L: SLIDE R"
-
                             else:
                                 status_l = "L: FORWARD"
-
-                        color_l = (0,255,0)
-
+                        color_l = (0, 255, 0)
                     elif is_t_open:
-
                         if i_tip.y > i_mcp.y - 0.06:
-
+                            # Reverse gesture
                             linear_x = -self.base_linear_speed
                             status_l = "L: REVERSE"
-                            color_l = (255,0,255)
+                            color_l  = (255, 0, 255)
 
-                    cv2.circle(frame,(int(t_tip.x*w),int(t_tip.y*h)),10,(255,0,255),-1)
-                    cv2.circle(frame,(int(i_tip.x*w),int(i_tip.y*h)),10,(0,255,0),-1)
+                    cv2.circle(frame, (int(t_tip.x*w), int(t_tip.y*h)), 10, (255,0,255), -1)
+                    cv2.circle(frame, (int(i_tip.x*w), int(i_tip.y*h)), 10, (0,255,0),   -1)
 
-                # RIGHT HAND (speed adjust only)
+                # Left hand (mirrored) = speed adjustment only
                 elif hand_label == "Left":
-
-                    ti_tip = lm[4]
-                    in_mcp = lm[5]
-                    in_tip = lm[8]
-
-                    wrist = lm[0]
+                    ti_tip     = lm[4]
+                    in_mcp     = lm[5]
+                    in_tip     = lm[8]
+                    wrist      = lm[0]
                     middle_mcp = lm[9]
 
-                    hand_size = self.distance(wrist, middle_mcp)
+                    hand_size  = self.distance(wrist, middle_mcp)
                     thumb_dist = self.distance(ti_tip, in_mcp)
-
                     dx = in_tip.x - in_mcp.x
 
-                    self.smooth_thumb_dist_r = (
-                        self.alpha * thumb_dist +
-                        (1 - self.alpha) * self.smooth_thumb_dist_r
-                    )
+                    self.smooth_thumb_dist_r = self.alpha * thumb_dist + (1-self.alpha) * self.smooth_thumb_dist_r
+                    self.smooth_dx_r         = self.alpha * dx          + (1-self.alpha) * self.smooth_dx_r
 
-                    self.smooth_dx_r = (
-                        self.alpha * dx +
-                        (1 - self.alpha) * self.smooth_dx_r
-                    )
-
-                    is_index_up = in_tip.y < in_mcp.y - 0.08
+                    is_index_up   = in_tip.y < in_mcp.y - 0.08
                     is_thumb_open = self.smooth_thumb_dist_r > (hand_size * 0.35)
 
                     if is_index_up:
-
-                        color_r = (0,255,255)
-
+                        color_r = (0, 255, 255)
                         if not is_thumb_open:
-
+                            # Adjust linear speed
                             if self.smooth_dx_r > 0.04:
-                                self.base_linear_speed = min(MAX_LINEAR, self.base_linear_speed + 0.02)
-
+                                self.base_linear_speed = min(MAX_LINEAR,  self.base_linear_speed  + 0.02)
                             elif self.smooth_dx_r < -0.04:
-                                self.base_linear_speed = max(MIN_LINEAR, self.base_linear_speed - 0.02)
-
+                                self.base_linear_speed = max(MIN_LINEAR,  self.base_linear_speed  - 0.02)
                             status_r = "R: LIN SPEED"
-
                         else:
-
+                            # Adjust angular speed
                             if self.smooth_dx_r > 0.04:
                                 self.base_angular_speed = min(MAX_ANGULAR, self.base_angular_speed + 0.02)
-
                             elif self.smooth_dx_r < -0.04:
                                 self.base_angular_speed = max(MIN_ANGULAR, self.base_angular_speed - 0.02)
-
                             status_r = "R: ANG SPEED"
 
-                    cv2.circle(frame,(int(in_tip.x*w),int(in_tip.y*h)),10,(0,255,255),-1)
-                    cv2.circle(frame,(int(ti_tip.x*w),int(ti_tip.y*h)),10,(255,0,255),-1)
+                    cv2.circle(frame, (int(in_tip.x*w), int(in_tip.y*h)), 10, (0,255,255), -1)
+                    cv2.circle(frame, (int(ti_tip.x*w), int(ti_tip.y*h)), 10, (255,0,255), -1)
 
-        twist = Twist()
-        twist.linear.x = float(linear_x)
-        twist.linear.y = float(linear_y)
-        twist.angular.z = float(angular_z)
+        # Publish cmd_vel — blocked when is_stopped=True
+        if not self.is_stopped:
+            twist = Twist()
+            twist.linear.x  = float(linear_x)
+            twist.linear.y  = float(linear_y)
+            twist.angular.z = float(angular_z)
+            self.publisher_.publish(twist)
 
-        self.publisher_.publish(twist)
+        # HUD overlay
+        if self.is_stopped:
+            cv2.rectangle(frame, (0,0), (w,h), (0,0,60), 4)
+            cv2.putText(frame, '!! OBSTACLE STOP !!', (int(w*0.1), int(h*0.5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
 
-        cv2.rectangle(frame,(0,0),(w,90),(30,30,30),-1)
+        cv2.rectangle(frame, (0,0), (w,90), (30,30,30), -1)
+        cv2.putText(frame, status_l, (20,35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_l, 2)
+        cv2.putText(frame, status_r, (int(w*0.45),35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_r, 2)
+        cv2.putText(frame, f"LIN:{self.base_linear_speed:.2f}   ANG:{self.base_angular_speed:.2f}",
+                    (20,70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
 
-        cv2.putText(frame,status_l,(20,35),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.7,color_l,2)
-
-        cv2.putText(frame,status_r,(int(w*0.45),35),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.7,color_r,2)
-
-        cv2.putText(
-            frame,
-            f"LIN:{self.base_linear_speed:.2f}   ANG:{self.base_angular_speed:.2f}",
-            (20,70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (200,200,200),
-            2
-        )
-
-        cv2.imshow('Mecanum Dual Hand Master',frame)
+        cv2.imshow('Mecanum Dual Hand Master', frame)
         cv2.waitKey(1)
 
 
 def main():
-
     rclpy.init()
-
     node = CamTeleop()
-
     try:
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         pass
-
     finally:
-
-        node.publisher_.publish(Twist())
-
+        node.publisher_.publish(Twist())   # send stop on exit
         node.destroy_node()
         rclpy.shutdown()
 

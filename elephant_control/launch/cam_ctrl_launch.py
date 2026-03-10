@@ -15,7 +15,6 @@ def generate_launch_description():
         executable='cam_teleop',
         name='cam_teleop_control',
         output='screen',
-        # parameters=[{'use_sim_time': False}] 
     )
 
     reset_speed_server = Node(
@@ -31,6 +30,13 @@ def generate_launch_description():
         name='UDP_receiver_runner',
         output='screen'
     )
+
+    lidar_scanner = Node(
+        package='elephant_control',
+        executable='lidar_scan',
+        name='lidar_distance_scan',
+        output='screen'
+    )
     
 
 
@@ -38,6 +44,7 @@ def generate_launch_description():
         camera_node,
         teleop_node,
         reset_speed_server,
-        laptop_UDP_receiver
+        laptop_UDP_receiver,
+        lidar_scanner
         
     ])

@@ -3,7 +3,7 @@
 node2_udp_gateway_laptop.py
 รันบน Laptop  (ROS_DOMAIN_ID=79)
 
-Flow ส่ง:  /cmd_vel_command → UDP:15000 → AGV
+Flow ส่ง:  /cmd_vel_safe → UDP:15000 → AGV  (กรองผ่าน lidar_guard แล้ว)
 Flow รับ:  AGV UDP:15001    → /scan_distance (Domain 79)
 
 run:
@@ -17,7 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float32
+from std_msgs.msg import String
 
 
 class UdpGatewayLaptop(Node):
@@ -40,9 +40,10 @@ class UdpGatewayLaptop(Node):
         self.create_subscription(
             Twist, '/cmd_vel_command', self._cmd_cb, qos)
 
-        # ── รับ DIST จาก AGV ─────────────────────────────────────
-        self.dist_pub = self.create_publisher(Float32, '/scan_distance', qos)
+        # ── รับ DIST+ANGLE จาก AGV ───────────────────────────────
+        self.dist_pub = self.create_publisher(String, '/scan_distance', qos)
         self.sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock_recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock_recv.bind(('0.0.0.0', self.data_port))
         threading.Thread(target=self._data_loop, daemon=True).start()
 
@@ -60,10 +61,10 @@ class UdpGatewayLaptop(Node):
         while rclpy.ok():
             try:
                 data, _ = self.sock_recv.recvfrom(2048)
-                val = float(data.decode().strip())
-                if val == val and val != float('inf'):   # NaN / inf check
-                    msg = Float32()
-                    msg.data = val
+                payload = data.decode().strip()
+                if ',' in payload:          # format "distance,angle"
+                    msg = String()
+                    msg.data = payload
                     self.dist_pub.publish(msg)
             except socket.timeout:
                 pass
@@ -79,6 +80,12 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # ส่ง stop command ไปหา AGV ก่อน shutdown
+        try:
+            stop = b'0.0000 0.0000 0.0000'
+            node.sock_send.sendto(stop, (node.robot_ip, node.cmd_port))
+        except Exception:
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
